@@ -26,7 +26,7 @@
 
 // ─── Pin definitions ─────────────────────────────────────────────────────────
 #define PIN_NSS   PA4
-#define PIN_DIO1  RADIOLIB_NC   // Not exposed on DX-LR30; use polling
+#define PIN_DIO1  PC15   // Verified connected to PC15 on this HW revision (shared with LSE OSC32_OUT)
 #define PIN_NRST  PA3
 #define PIN_BUSY  PA2
 #define PIN_TXEN  PA0
@@ -195,6 +195,15 @@ static uint32_t ts_base = 0;   // set in setup(); millis() added at runtime
 // ─── RadioLib object ─────────────────────────────────────────────────────────
 SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI);
 
+// ─── DIO1 interrupt flag ─────────────────────────────────────────────────────
+// Set by the DIO1 ISR when the radio raises an interrupt (RxDone).
+// The main loop polls this flag instead of continuously reading getIrqFlags().
+static volatile bool rx_flag = false;
+
+static void on_dio1(void) {
+    rx_flag = true;
+}
+
 static bool radio_init(void) {
     SPI.begin();
     int state = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR,
@@ -205,6 +214,7 @@ static bool radio_init(void) {
     }
     radio.setRfSwitchPins(PIN_RXEN, PIN_TXEN);
     radio.setCRC(2);   // CRC-16 on
+    radio.setDio1Action(on_dio1);   // DIO1 (PC15) fires on RxDone → sets rx_flag
     return true;
 }
 
@@ -463,10 +473,11 @@ void loop(void) {
         digitalWrite(PIN_LED, LED_OFF);
     }
 
-    // ── Non-blocking receive (startReceive + IRQ polling) ────────────────────
-    // ⚠️  DIO1 is NOT connected on DX-LR30, so we CANNOT use radio.receive()
-    //     (it blocks forever). Instead, use startReceive() + poll getIrqFlags().
-    //     See docs/development-notes.md#radiolib-polling-mode-dio1-not-connected
+    // ── Interrupt-driven receive (DIO1/PC15 fires on RxDone) ─────────────────
+    // DIO1 is connected to PC15 on this HW revision, so we use setDio1Action()
+    // (registered in radio_init) instead of polling getIrqFlags(). The ISR sets
+    // rx_flag; here we react to it. startReceive() arms the radio; on RxDone the
+    // ISR fires, we read the packet, and re-arm.
     if (!rx_started) {
         rf_rx();
         int err = radio.startReceive();
@@ -476,9 +487,8 @@ void loop(void) {
         rx_started = true;
     }
 
-    // Poll IRQ flags, bit 1 = RxDone, bit 5 = Timeout (SX1262 IRQ mask)
-    uint16_t irq = radio.getIrqFlags();
-    if (irq & 0x0002) {                        // RxDone
+    if (rx_flag) {
+        rx_flag = false;                      // RxDone
         uint8_t rxbuf[MAX_PKT];
         int state = radio.readData(rxbuf, 0);
         rx_started = false;
@@ -503,9 +513,15 @@ void loop(void) {
                 }
             }
         } else {
+            // CRC error or other read failure — re-arm and continue
             Serial1.print("readData err: "); Serial1.println(state);
         }
-    } else if (irq & 0x0200) {                 // RxTimeout
-        rx_started = false;
     }
+        // ── Enter SLEEP until next interrupt ─────────────────────────────────────
+    // __WFI() halts the CPU in SLEEP mode until any interrupt fires:
+    //   - SysTick (every 1ms) keeps millis() running → ADVERT/heartbeat timing
+    //     and IWatchdog.reload() still work (loop re-runs each tick)
+    //   - DIO1 (PC15) interrupt wakes on incoming packet → sets rx_flag
+    // This reduces CPU power vs. spinning the loop continuously.
+    __WFI(); 
 }
