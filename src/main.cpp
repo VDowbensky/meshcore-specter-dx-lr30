@@ -336,7 +336,7 @@ static bool process_pkt(const uint8_t* data, int len) {
                 memcpy(relay_buf, data, len);
 
                 if (dedup_seen(relay_buf, ptype, (uint8_t)relay_len)) {
-                    Serial1.println("Drop: dedup direct"); continue;
+                    Serial1.println("Drop: dedup direct"); return false;
                 }
 
                 Serial1.println("Relay direct");
