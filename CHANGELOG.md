@@ -2,7 +2,20 @@
 
 All notable changes to SPECTER firmware are documented here.
 
-## [1.1.0] - Current
+## [1.1.1] - Current fork
+
+### Added
+- Incorporated Ping function from majonezz/meshcore-specter-dx-lr30
+- Reduced idle consumption to 35mA by including DIO1 interrupt and SMT32 sleep from mkubi/meshcore-specter-dx-lr30
+
+### Fixed
+- Fixed RadioLib compilation issue caused by changes in stm32duino
+- Fixed deduplicate for Relay direct
+
+### Changed
+- Direct packets are routed without delays
+
+## [1.1.0]
 
 ### Added
 - **Ed25519 cryptographic signing** of ADVERT packets using rweather/Crypto library
