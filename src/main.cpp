@@ -49,6 +49,7 @@
 #define ROUTE_DIRECT           0x02
 #define ROUTE_TRANSPORT_DIRECT 0x03
 #define PAYLOAD_ADVERT         0x04
+#define PAYLOAD_TYPE_TRACE	   0x09
 #define MAX_HOPS               64
 #define MAX_PKT                256
 
@@ -297,6 +298,14 @@ static bool process_pkt(const uint8_t* data, int len) {
     uint8_t hop_count = path_hdr & 0x3F;
     uint8_t hs_code   = (path_hdr >> 6) & 0x03;
     uint8_t hash_size = hs_code + 1;   // 1–4 bytes per hop
+	uint8_t ptype = (header >> 2) & 0x0F; 
+
+    Serial1.print("Received packet: ");
+	for (int i = 0; i < len; i++) {
+	    if (data[i] < 0x10) {Serial1.print("0");}
+	    Serial1.print(data[i], HEX);
+	}
+    Serial1.println();
 
     int path_bytes = hop_count * hash_size;
     if (idx + path_bytes > len) { Serial1.println("Drop: malformed"); return false; }
@@ -317,6 +326,20 @@ static bool process_pkt(const uint8_t* data, int len) {
                 Serial1.println("Relay direct");
                 return true;
             }
+        }
+        if ((ptype == PAYLOAD_TYPE_TRACE) && (own_hash == data[len-1])) {  //PING packet
+	        if ((payload_len != 10)) return false; // Is it fixed length?
+		    uint32_t ping_id;
+		    memcpy(&ping_id, payload_ptr, 4);
+		    relay_len = 0;
+		    relay_buf[relay_len++] = ROUTE_DIRECT | (PAYLOAD_TYPE_TRACE<<2);
+		    relay_buf[relay_len++] = 0x01;  
+		    relay_buf[relay_len++] = (int8_t)(radio.getSNR() * 4.0f);
+		    memcpy(relay_buf + relay_len, payload_ptr, payload_len);
+		    relay_len += payload_len;
+            Serial1.print("Ping: "); Serial1.println(ping_id, HEX);
+            no_delay = true;
+		    return true;
         }
         return false;   // Our hash not in path — not our route
     }
