@@ -323,6 +323,11 @@ static bool process_pkt(const uint8_t* data, int len) {
                 if (len > MAX_PKT) return false;
                 relay_len = len;
                 memcpy(relay_buf, data, len);
+
+                if (dedup_seen(relay_buf, ptype, (uint8_t)relay_len)) {
+                    Serial1.println("Drop: dedup direct"); continue;
+                }
+
                 Serial1.println("Relay direct");
                 return true;
             }
@@ -352,11 +357,10 @@ static bool process_pkt(const uint8_t* data, int len) {
     // Guard: payload sanity
     if (payload_len < 1) { Serial1.println("Drop: malformed"); return false; }
 
-    uint8_t ptype = (header >> 2) & 0x0F;
 
     // Dedup check
     if (dedup_seen(payload_ptr, ptype, (uint8_t)payload_len)) {
-        Serial1.println("Drop: dedup"); return false;
+        Serial1.println("Drop: dedup flood"); return false;
     }
 
     // Guard: our hash already in path (loop prevention)
