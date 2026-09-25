@@ -269,11 +269,22 @@ static int build_advert(uint8_t* buf) {
     return i;
 }
 
+// Direct packets are routed without a delay. See getDirectRetransmitDelay(pkt)
+static bool no_delay = false;
+
 // ─── Send a packet (with RF switch) ─────────────────────────────────────────
 static bool send_pkt(const uint8_t* buf, int len) {
     rf_idle();
-    // Random CSMA backoff 300–800 ms
-    delay(300 + (millis() % 500));
+
+    if (no_delay) {
+        delay(10);
+        no_delay = false;
+    }
+    else {
+        // Random CSMA backoff 300–800 ms to respect Ch utilization limits
+        delay(300 + (millis() % 500));
+    }
+   
     rf_tx();
     int state = radio.transmit(const_cast<uint8_t*>(buf), len);
     rf_idle();
@@ -306,7 +317,7 @@ static bool process_pkt(const uint8_t* data, int len) {
 	    Serial1.print(data[i], HEX);
 	}
     Serial1.println();
-
+    
     int path_bytes = hop_count * hash_size;
     if (idx + path_bytes > len) { Serial1.println("Drop: malformed"); return false; }
 
@@ -329,6 +340,7 @@ static bool process_pkt(const uint8_t* data, int len) {
                 }
 
                 Serial1.println("Relay direct");
+                no_delay = true;
                 return true;
             }
         }
@@ -345,7 +357,7 @@ static bool process_pkt(const uint8_t* data, int len) {
             Serial1.print("Ping: "); Serial1.println(ping_id, HEX);
             no_delay = true;
 		    return true;
-        }
+	    }        
         return false;   // Our hash not in path — not our route
     }
 
