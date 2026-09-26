@@ -282,7 +282,7 @@ static bool send_pkt(const uint8_t* buf, int len) {
     }
     else {
         // Random CSMA backoff 300–800 ms to respect Ch utilization limits
-        delay(300 + (millis() % 500));
+        delay(random(300, 800));
     }
    
     rf_tx();
@@ -426,6 +426,8 @@ void setup(void) {
     Serial1.begin(115200);
     delay(200);
     IWatchdog.begin(8000000);  // 8 s IWDG — auto-resets if radio HALT or loop freeze
+
+    randomSeed(*(volatile uint32_t*)0x1FFFF7E8U + *(volatile uint32_t*)0x1FFFF7ECU); //Seed w/ STM32 UID
 
     ts_base = build_unix_ts();
     Serial1.println();
