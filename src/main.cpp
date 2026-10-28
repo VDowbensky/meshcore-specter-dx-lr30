@@ -1,7 +1,7 @@
 /*
  * SPECTER, Native MeshCore Flood Repeater
  * Hardware: STM32F103C8T6 + SX1262 (DX-LR30 module)
- * Version: 1.1.0
+ * Version: 1.2.0
  *
  * Pin mapping (confirmed from BoardInfo + sx1262_driver.h):
  *   SPI1 : SCK=PA5  MISO=PA6  MOSI=PA7
@@ -10,8 +10,11 @@
  *   LED  : PB11 (active HIGH)
  *   UART1: TX=PA9  RX=PA10  → CH340 USB (requires ENABLE_HWSERIAL1 flag)
  *
- * MeshCore radio settings (EU868 UK channel):
- *   Freq=869.618 MHz  SF=8  BW=62.5 kHz  CR=4/8  SyncWord=0x12
+ * Radio settings: runtime-configurable via CLI (docs/cli.md),
+ * EU868 defaults: 869.618 MHz  SF8  BW 62.5 kHz  SyncWord 0x12
+ *
+ * CLI: USB-serial MeshCore command subset (ver, name, lat/lon, radio,
+ * advert intervals, neighbors, stats, ...). See docs/cli.md.
  */
 
 #include <Arduino.h>
@@ -20,9 +23,10 @@
 #include <SHA256.h>
 #include <Ed25519.h>
 #include <IWatchdog.h>
+#include "config.h"
 
 // ─── Version ─────────────────────────────────────────────────────────────────
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.14.0"
 
 // ─── Pin definitions ─────────────────────────────────────────────────────────
 #define PIN_NSS   PA4
@@ -36,10 +40,6 @@
 #define LED_OFF   LOW
 
 // ─── Radio settings ──────────────────────────────────────────────────────────
-#define LORA_FREQ   869.618f
-#define LORA_SF     8
-#define LORA_BW     62.5f
-#define LORA_CR     8            // 4/8  (EU/UK Narrow preset standard)
 #define LORA_PREAMBLE 8
 #define LORA_SYNC   0x12         // LoRa private network
 
@@ -49,18 +49,19 @@
 #define ROUTE_DIRECT           0x02
 #define ROUTE_TRANSPORT_DIRECT 0x03
 #define PAYLOAD_ADVERT         0x04
-#define PAYLOAD_TYPE_TRACE	   0x09
+#define PAYLOAD_TYPE_TRACE     0x09
 #define MAX_HOPS               64
 #define MAX_PKT                256
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
-#define LOCAL_ADVERT_INTERVAL_MS (2UL * 60UL * 1000UL)   // 2 minutes (neighbor discovery)
-#define FLOOD_ADVERT_INTERVAL_MS (12UL * 3600UL * 1000UL) // 12 hours (global presence)
-#define FIRST_ADVERT_MS          5000UL                   // 5 s after boot
-#define RX_TIMEOUT_MS            30000                    // poll cycle
+#define FIRST_ADVERT_MS        5000UL                   // 5 s after boot
+#define DISCOVERY_BURST        5                        // zero-hop adverts
+#define DISCOVERY_INTERVAL_MS  1000UL
+#define DUTY_SILENCE_MAX_MS    30000UL
 
 // ─── Node identity ────────────────────────────────────────────────────────────
-// Default: auto-generated name "SPECTER-XXXX" + key derived from STM32 UID.
+// Default: auto-generated name "SPECTER-XXXX" (in prefs defaults) + key
+// derived from STM32 UID.
 //
 // For a fixed identity (e.g. to control the path-hash byte), set in platformio.ini:
 //   -D NODE_NAME_STR=\"SPECTER-1811\"
@@ -68,13 +69,8 @@
 //
 // The path hash is always pubkey[0], so pick a seed whose public key starts
 // with the desired byte. Use tools/gen_identity.py to search for one.
-#ifdef NODE_NAME_STR
-static const char node_name[] = NODE_NAME_STR;
-#else
-static char node_name[14];   // "SPECTER-" + 4 hex digits + null
-#endif
 static uint8_t own_privkey[32];
-static uint8_t own_pubkey[32];
+uint8_t own_pubkey[32];
 static uint8_t own_hash;     // 1-byte path hash = own_pubkey[0]
 
 // ── Compile-time hex → bytes helper (constexpr-friendly for a macro) ─────────
@@ -89,6 +85,12 @@ static void hex2bin(const char* hex, uint8_t* out, int len) {
 }
 
 static void identity_init(void) {
+    // If auto-generated placeholder name, replace with UID-based one
+    if (strcmp(cfg.name, DEF_NAME) == 0) {
+        const uint32_t uid_lo = *(volatile uint32_t*)0x1FFFF7F0U;
+        snprintf(cfg.name, sizeof(cfg.name), "SPECTER-%04X",
+                 (unsigned)(uid_lo & 0xFFFF));
+    }
 #ifdef FIXED_PRIVKEY_HEX
     // ── Fixed identity: use pre-generated keypair with known path hash ───────
     hex2bin(FIXED_PRIVKEY_HEX, own_privkey, 32);
@@ -100,14 +102,10 @@ static void identity_init(void) {
         *(volatile uint32_t*)0x1FFFF7ECU,
         *(volatile uint32_t*)0x1FFFF7F0U,
     };
-#ifndef NODE_NAME_STR
-    snprintf(node_name, sizeof(node_name), "SPECTER-%04X",
-             (unsigned)(uid[2] & 0xFFFF));
-#endif
     SHA256 sha;
     sha.reset();
-    const uint8_t domain[] = "SPECTER-MESHCORE-KEY-V1";
-    sha.update(domain, sizeof(domain) - 1);
+    const char* domain = "SPECTER-MESHCORE-KEY-V1";
+    sha.update((const uint8_t*)domain, strlen(domain));
     sha.update((const uint8_t*)uid, 12);
     sha.finalize(own_privkey, 32);
     Ed25519::derivePublicKey(own_pubkey, own_privkey);
@@ -146,9 +144,9 @@ static bool dedup_seen(const uint8_t* payload, uint8_t ptype, uint8_t plen) {
 // ─── RF switch helpers ───────────────────────────────────────────────────────
 static void rf_rx(void)   { digitalWrite(PIN_TXEN, LOW);  digitalWrite(PIN_RXEN, HIGH); }
 static void rf_tx(void)   { digitalWrite(PIN_TXEN, HIGH); digitalWrite(PIN_RXEN, LOW);  }
-static void rf_idle(void) { digitalWrite(PIN_TXEN, LOW);  digitalWrite(PIN_RXEN, LOW);  }
+static void rf_idle(void) { digitalWrite(PIN_TXEN, LOW);  digitalWrite(PIN_RXEN, LOW); }
 
-// LED patterns (active LOW on PC13)
+// LED patterns (active HIGH on PB11)
 //   1 blink        = packet received
 //   2 fast blinks  = relay transmitted (connectivity confirmed)
 //   solid ON       = ADVERT transmitting
@@ -165,9 +163,10 @@ static void led_blink(uint8_t n, uint16_t ms) {
 // Converts __DATE__ "Mmm DD YYYY" + __TIME__ "HH:MM:SS" → Unix epoch seconds.
 // Used as timestamp base so ADVERTs carry valid Unix time (companions may
 // reject packets where |now - ts| > 3600 s as replay-protection).
+// Re-sync at runtime with the CLI `time <epoch>` command.
 static uint32_t build_unix_ts(void) {
     const char* d = __DATE__;   // "May 31 2026"
-    const char* t = __TIME__;   // "14:30:00"
+    const char* t = __TIME__;   // "14:32:33"
     // Month
     static const char* mn = "JanFebMarAprMayJunJulAugSepOctNovDec";
     int month = 1;
@@ -196,6 +195,10 @@ static uint32_t ts_base = 0;   // set in setup(); millis() added at runtime
 // ─── RadioLib object ─────────────────────────────────────────────────────────
 SX1262 radio = new Module(PIN_NSS, PIN_DIO1, PIN_NRST, PIN_BUSY, SPI);
 
+static uint32_t radio_airtime_ms = 200;   // estimated, set in radio_init()
+static bool     radio_ok         = false; // radio_init() has succeeded
+static uint32_t last_radio_retry = 0;     // degraded-mode retry timer
+
 // ─── DIO1 interrupt flag ─────────────────────────────────────────────────────
 // Set by the DIO1 ISR when the radio raises an interrupt (RxDone).
 // The main loop polls this flag instead of continuously reading getIrqFlags().
@@ -207,8 +210,10 @@ static void on_dio1(void) {
 
 static bool radio_init(void) {
     SPI.begin();
-    int state = radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR,
-                            LORA_SYNC, 14 /*dBm*/, LORA_PREAMBLE);
+    float freq_mhz = cfg.freq_khz / 1000.0f;
+    float bw_khz   = cfg.bw_tenth / 10.0f;
+    int state = radio.begin(freq_mhz, bw_khz, cfg.sf, cfg.cr,
+                            LORA_SYNC, cfg.tx_dbm, LORA_PREAMBLE);
     if (state != RADIOLIB_ERR_NONE) {
         Serial1.print("FAILED: "); Serial1.println(state);
         return false;
@@ -216,6 +221,13 @@ static bool radio_init(void) {
     radio.setRfSwitchPins(PIN_RXEN, PIN_TXEN);
     radio.setCRC(2);   // CRC-16 on
     radio.setDio1Action(on_dio1);   // DIO1 (PC15) fires on RxDone → sets rx_flag
+
+    // Estimate worst-case on-air time for duty-cycle enforcement:
+    // symbol time = 2^sf / bw; ~160 symbols covers preamble + ~50 B payload
+    float sym_ms = (float)(1UL << (cfg.sf & 0x0F)) / bw_khz;
+    radio_airtime_ms = (uint32_t)(sym_ms * 160.0f) + 50;
+    if (radio_airtime_ms < 50)  radio_airtime_ms = 50;
+    if (radio_airtime_ms > 2000) radio_airtime_ms = 2000;
     return true;
 }
 
@@ -245,21 +257,25 @@ static int build_advert(uint8_t* buf) {
 
     // appdata: flags [+ lat/lon] [+ name]
     int appdata_offset = i;
-#if defined(NODE_LAT_I) && defined(NODE_LON_I)
-    buf[i++] = 0x92;  // FLAG_IS_REPEATER(0x02) | FLAG_HAS_LOCATION(0x10) | FLAG_HAS_NAME(0x80)
-    int32_t _lat = (int32_t)(NODE_LAT_I);
-    int32_t _lon = (int32_t)(NODE_LON_I);
-    memcpy(buf + i, &_lat, 4); i += 4;
-    memcpy(buf + i, &_lon, 4); i += 4;
-#else
-    buf[i++] = 0x82;  // FLAG_IS_REPEATER(0x02) | FLAG_HAS_NAME(0x80)
-#endif
-    uint8_t nlen = (uint8_t)strlen(node_name);
-    memcpy(buf + i, node_name, nlen); i += nlen;
+    bool has_loc = (cfg.lat_micro != 0 || cfg.lon_micro != 0);
+    if (has_loc) {
+        buf[i++] = 0x92;  // FLAG_IS_REPEATER(0x02) | FLAG_HAS_LOCATION(0x10) | FLAG_HAS_NAME(0x80)
+        int32_t lat = cfg.lat_micro;
+        int32_t lon = cfg.lon_micro;
+        memcpy(buf + i, &lat, 4); i += 4;
+        memcpy(buf + i, &lon, 4); i += 4;
+    } else {
+        buf[i++] = 0x82;  // FLAG_IS_REPEATER(0x02) | FLAG_HAS_NAME(0x80)
+    }
+    // Name (advert limit: 23 B with location, 31 without)
+    uint8_t nlen = (uint8_t)strlen(cfg.name);
+    uint8_t maxn = has_loc ? 23 : 31;
+    if (nlen > maxn) nlen = maxn;
+    memcpy(buf + i, cfg.name, nlen); i += nlen;
     int appdata_len = i - appdata_offset;
 
     // Sign: message = pubkey(32) + timestamp(4) + appdata
-    uint8_t msg[32 + 4 + 80];  // appdata: 1 flags + 8 GPS + 15 name = 24 bytes max
+    uint8_t msg[32 + 4 + 96];  // appdata: 1 flags + 8 GPS + 31 name = 40 bytes max
     int mlen = 0;
     memcpy(msg + mlen, own_pubkey, 32);           mlen += 32;
     memcpy(msg + mlen, buf + 2 + 32, 4);          mlen += 4;   // timestamp from buf
@@ -272,7 +288,7 @@ static int build_advert(uint8_t* buf) {
 // Direct packets are routed without a delay. See getDirectRetransmitDelay(pkt)
 static bool no_delay = false;
 
-// ─── Send a packet (with RF switch) ─────────────────────────────────────────
+// ─── Send a packet (with RF switch + EU duty-cycle enforcement) ──────────────
 static bool send_pkt(const uint8_t* buf, int len) {
     rf_idle();
 
@@ -282,22 +298,46 @@ static bool send_pkt(const uint8_t* buf, int len) {
     }
     else {
         // Random CSMA backoff 300–800 ms to respect Ch utilization limits
-        delay(random(300, 800));
+        delay(300 + (millis() % 500));
     }
-   
+
     rf_tx();
     int state = radio.transmit(const_cast<uint8_t*>(buf), len);
     rf_idle();
+
+    // EU duty cycle: after each TX, silent period ≈ on-air × (100/duty − 1)
+    if (state == RADIOLIB_ERR_NONE && cfg.dutycycle > 0 && cfg.dutycycle < 100) {
+        uint32_t silence = radio_airtime_ms * (100UL / cfg.dutycycle - 1UL);
+        if (silence > DUTY_SILENCE_MAX_MS) silence = DUTY_SILENCE_MAX_MS;
+        uint32_t t0 = millis();
+        while (millis() - t0 < silence) {
+            IWatchdog.reload();
+            cli_poll();   // stay responsive to admin during enforced silence
+            delay(10);
+        }
+    }
     return (state == RADIOLIB_ERR_NONE);
 }
 
 // ─── Process received flood packet ───────────────────────────────────────────
 // Returns true if a relay packet should be sent (writes it to relay_buf/relay_len)
+#include <stdarg.h>
+static void slog(const char* fmt, ...) {
+    char buf[72];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    console_log(buf);
+}
+
+static void slog(const char* fmt, ...);   // fmt-logger → console ring
+
 static uint8_t relay_buf[MAX_PKT];
 static int     relay_len = 0;
 
 static bool process_pkt(const uint8_t* data, int len) {
-    if (len < 3) { Serial1.println("Drop: malformed"); return false; }
+    if (len < 3) { slog("Drop: malformed"); return false; }
 
     uint8_t header = data[0];
     uint8_t route  = header & 0x03;
@@ -309,21 +349,22 @@ static bool process_pkt(const uint8_t* data, int len) {
     uint8_t hop_count = path_hdr & 0x3F;
     uint8_t hs_code   = (path_hdr >> 6) & 0x03;
     uint8_t hash_size = hs_code + 1;   // 1–4 bytes per hop
-	uint8_t ptype = (header >> 2) & 0x0F; 
+    uint8_t ptype     = (header >> 2) & 0x0F;
 
-    Serial1.print("Received packet: ");
-	for (int i = 0; i < len; i++) {
-	    if (data[i] < 0x10) {Serial1.print("0");}
-	    Serial1.print(data[i], HEX);
-	}
-    Serial1.println();
-    
     int path_bytes = hop_count * hash_size;
-    if (idx + path_bytes > len) { Serial1.println("Drop: malformed"); return false; }
+    if (idx + path_bytes > len) { slog("Drop: malformed"); return false; }
 
     const uint8_t* path_ptr    = data + idx;
     const uint8_t* payload_ptr = data + idx + path_bytes;
     int            payload_len = len - idx - path_bytes;
+
+    // ── Neighbor cache: record every ADVERT we hear ──────────────────────────
+    if (ptype == PAYLOAD_ADVERT && payload_len >= 40) {
+        uint32_t adv_ts;
+        memcpy(&adv_ts, payload_ptr + 32, 4);
+        int8_t snr_x4 = (int8_t)(radio.getSNR() * 4.0f);
+        neighbor_add(payload_ptr, adv_ts, snr_x4);
+    }
 
     // ── DIRECT routing ────────────────────────────────────────────────────────
     // Re-transmit packet UNCHANGED if our hash appears anywhere in the path.
@@ -336,49 +377,59 @@ static bool process_pkt(const uint8_t* data, int len) {
                 memcpy(relay_buf, data, len);
 
                 if (dedup_seen(relay_buf, ptype, (uint8_t)relay_len)) {
-                    Serial1.println("Drop: dedup direct"); return false;
+                    slog("Drop: dedup direct");
+                    return false;
                 }
 
-                Serial1.println("Relay direct");
+                slog("Relay direct");
                 no_delay = true;
                 return true;
             }
         }
-        if ((ptype == PAYLOAD_TYPE_TRACE) && (own_hash == data[len-1])) {  //PING packet
-	        if ((payload_len != 10)) return false; // Is it fixed length?
-		    uint32_t ping_id;
-		    memcpy(&ping_id, payload_ptr, 4);
-		    relay_len = 0;
-		    relay_buf[relay_len++] = ROUTE_DIRECT | (PAYLOAD_TYPE_TRACE<<2);
-		    relay_buf[relay_len++] = 0x01;  
-		    relay_buf[relay_len++] = (int8_t)(radio.getSNR() * 4.0f);
-		    memcpy(relay_buf + relay_len, payload_ptr, payload_len);
-		    relay_len += payload_len;
-            Serial1.print("Ping: "); Serial1.println(ping_id, HEX);
+        if ((ptype == PAYLOAD_TYPE_TRACE) && (own_hash == data[len-1])) {  // PING packet
+            if ((payload_len != 10)) return false; // Is it fixed length?
+            uint32_t ping_id;
+            memcpy(&ping_id, payload_ptr, 4);
+            relay_len = 0;
+            relay_buf[relay_len++] = ROUTE_DIRECT | (PAYLOAD_TYPE_TRACE<<2);
+            relay_buf[relay_len++] = 0x01;
+            relay_buf[relay_len++] = (int8_t)(radio.getSNR() * 4.0f);
+            memcpy(relay_buf + relay_len, payload_ptr, payload_len);
+            relay_len += payload_len;
+            slog("Ping: %08lX", (unsigned long)ping_id);
             no_delay = true;
-		    return true;
-	    }        
+            return true;
+        }
         return false;   // Our hash not in path — not our route
     }
 
     // ── FLOOD routing (ROUTE_FLOOD 0x01 + ROUTE_TRANSPORT_FLOOD 0x00) ────────
 
+    // Guard: relay disabled via CLI (`set repeat off`)
+    if (!cfg.repeat_en) { slog("Drop: repeat off"); return false; }
+
     // Guard: max hops
-    if (hop_count >= MAX_HOPS) { Serial1.println("Drop: max hops"); return false; }
+    if (hop_count >= (cfg.flood_max ? cfg.flood_max : MAX_HOPS)) {
+        slog("Drop: max hops"); return false;
+    }
 
     // Guard: payload sanity
-    if (payload_len < 1) { Serial1.println("Drop: malformed"); return false; }
-
+    if (payload_len < 1) { slog("Drop: malformed"); return false; }
 
     // Dedup check
     if (dedup_seen(payload_ptr, ptype, (uint8_t)payload_len)) {
-        Serial1.println("Drop: dedup flood"); return false;
+        slog("Drop: dedup flood");
+        return false;
     }
 
-    // Guard: our hash already in path (loop prevention)
-    for (int j = 0; j < hop_count; j++) {
-        if (path_ptr[j * hash_size] == own_hash) {
-            Serial1.println("Drop: our hash in path"); return false;
+    // Loop detection (off = skip; minimal/moderate/strict all drop when our
+    // hash appears in the path — 1-byte hashes make finer levels equivalent)
+    if (cfg.loop_detect != 0) {
+        for (int j = 0; j < hop_count; j++) {
+            if (path_ptr[j * hash_size] == own_hash) {
+                slog("Drop: our hash in path");
+                return false;
+            }
         }
     }
 
@@ -392,7 +443,8 @@ static bool process_pkt(const uint8_t* data, int len) {
 
     // Old path hashes
     if (relay_len + path_bytes + hash_size + payload_len >= MAX_PKT) {
-        Serial1.println("Drop: relay too large"); return false;
+        slog("Drop: relay too large");
+        return false;
     }
     memcpy(relay_buf + relay_len, path_ptr, path_bytes);
     relay_len += path_bytes;
@@ -407,7 +459,7 @@ static bool process_pkt(const uint8_t* data, int len) {
     memcpy(relay_buf + relay_len, payload_ptr, payload_len);
     relay_len += payload_len;
 
-    Serial1.print("Relay hop="); Serial1.println(new_hop);
+    slog("Relay hop=%u", (unsigned)new_hop);
     return true;
 }
 
@@ -427,29 +479,34 @@ void setup(void) {
     delay(200);
     IWatchdog.begin(8000000);  // 8 s IWDG — auto-resets if radio HALT or loop freeze
 
-    randomSeed(*(volatile uint32_t*)0x1FFFF7E8U + *(volatile uint32_t*)0x1FFFF7ECU); //Seed w/ STM32 UID
+    // ── Configuration: build-flag defaults ← flash prefs overlay ──────────────
+    prefs_load();
+    cli_begin();
 
     ts_base = build_unix_ts();
-    Serial1.println();
     identity_init();
+    Serial1.println();
     Serial1.print("=== SPECTER MeshCore Repeater v");
     Serial1.print(FW_VERSION);
     Serial1.print(" [");
-    Serial1.print(node_name);
+    Serial1.print(cfg.name);
     Serial1.println("] ===");
     Serial1.print("Hash: 0x"); Serial1.println(own_hash, HEX);
 
     Serial1.print("Radio init...");
-    if (!radio_init()) {
-        Serial1.println(" FAILED, halting");
-        while (true) {
-            digitalWrite(PIN_LED, LED_ON);  delay(100);
-            digitalWrite(PIN_LED, LED_OFF); delay(100);
-        }
+    if (radio_init()) {
+        radio_ok = true;
+        Serial1.println(" OK");
+        digitalWrite(PIN_LED, LED_OFF);   // OFF, ready
+    } else {
+        radio_ok = false;
+        // Do NOT halt: a bad radio setting (or a transient RF fault) must not
+        // brick the serial CLI. Stay in degraded mode — loop() keeps polling
+        // the CLI and retries radio_init() until the settings become valid.
+        Serial1.println(" FAILED - degraded mode, CLI alive, retrying");
+        slog("RADIO init FAILED: degraded mode (fix via CLI, e.g. 'set radio')");
+        digitalWrite(PIN_LED, LED_ON);    // solid on = radio not ready
     }
-    Serial1.println(" OK");
-
-    digitalWrite(PIN_LED, LED_OFF);   // OFF, ready
 }
 
 static uint32_t last_local_advert = 0;
@@ -457,27 +514,137 @@ static uint32_t last_flood_advert = 0;
 static bool     first_advert      = false;
 static bool     rx_started        = false;
 static uint32_t last_beat_ms      = 0;
+static bool     advert_pending    = false;      // CLI-triggered advert
+static bool     advert_zerohop    = false;
+static uint8_t  discovery_burst   = 0;          // zero-hop burst remaining
+static uint32_t last_burst_ms     = 0;
 
-// ─── Packet statistics (printed in ALIVE every 10 s) ─────────────────────────
-static uint32_t stat_rx    = 0;   // valid packets received from radio
-static uint32_t stat_relay = 0;   // packets successfully relayed
-static uint32_t stat_drop  = 0;   // packets rejected (dedup/hops/malformed)
+// ─── Packet statistics ───────────────────────────────────────────────────────
+uint32_t stat_rx    = 0;   // valid packets received from radio
+uint32_t stat_relay = 0;   // packets successfully relayed
+uint32_t stat_drop  = 0;   // packets rejected (dedup/hops/malformed)
+uint32_t stat_advert = 0;  // adverts transmitted
+
+// ─── Console log ring (declared in config.h, implemented in cli.cpp) ─────────
+// All runtime diagnostics go here instead of straight to serial; the user
+// reads them on demand with the `log` command.
+// ─── CLI hooks (declared in config.h, used by cli.cpp) ───────────────────────
+void cli_reboot(void) { NVIC_SystemReset(); }
+
+// ─── Programmatic bootloader entry (serial "DFU") ────────────────────────────
+// The STM32F103 has no USB DFU. If the board's BOOT0 and RESET lines are
+// accessible as GPIOs, define them in platformio.ini:
+//   -D DFU_BOOT0_PIN=PB12
+//   -D DFU_RST_PIN=PB13
+// then `dfu` over the CLI pulls BOOT0 high, pulses RESET low for 100 ms and
+// lets go → the MCU reboots into the UART bootloader (57600 8E1 on the same
+// USART1/CH340), ready for `stm32flash -w firmware.bin -v -R -b 57600 <port>`.
+#ifdef DFU_BOOT0_PIN
+void cli_dfu(void) {
+    pinMode(DFU_BOOT0_PIN, OUTPUT);
+    pinMode(DFU_RST_PIN,   OUTPUT);
+    digitalWrite(DFU_RST_PIN, HIGH);    // ensure not held in reset
+    delay(20);
+    Serial1.println("OK - entering bootloader in 1s");
+    delay(1000);                        // let the reply drain through CH340
+    digitalWrite(DFU_BOOT0_PIN, HIGH);  // BOOT0=1 on the reset edge
+    delay(20);
+    digitalWrite(DFU_RST_PIN, LOW);     // pulse NRST
+    delay(100);
+    digitalWrite(DFU_RST_PIN, HIGH);    // release → reset with BOOT0 high
+    while (true) { delay(10); }         // (unreachable; bootloader takes over)
+}
+#endif
+
+uint32_t cli_now_epoch(void) { return ts_base + millis() / 1000UL; }
+
+void cli_set_time(uint32_t epoch) { ts_base = epoch - millis() / 1000UL; }
+
+const char* cli_version_str(void) {
+    static char buf[32];
+    snprintf(buf, sizeof(buf), "%s (%s)", FW_VERSION, __DATE__);
+    return buf;
+}
+
+void cli_send_advert_now(bool zero_hop) {
+    if (zero_hop) {
+        // Immediate zero-hop advert + short discovery burst
+        advert_pending = true;
+        advert_zerohop = true;
+        discovery_burst = DISCOVERY_BURST;
+    } else {
+        advert_pending = true;
+        advert_zerohop = false;
+    }
+}
 
 void loop(void) {
     IWatchdog.reload();
     uint32_t now = millis();
 
+    // ── CLI (USB serial) ─────────────────────────────────────────────────────
+    cli_poll();   // ALWAYS polled, even in degraded mode, so serial is never bricked
+
+    // ── Radio not ready: retry init periodically, do no radio work ──────────────
+    if (!radio_ok) {
+        if (now - last_radio_retry >= 3000UL) {
+            last_radio_retry = now;
+            if (radio_init()) {
+                radio_ok     = true;
+                rx_started   = false;
+                first_advert = false;   // re-send the initial advert once up
+                slog("RADIO up after retry");
+                digitalWrite(PIN_LED, LED_OFF);
+            } else {
+                led_blink(3, 120);      // triple-blink = radio still down
+            }
+        }
+        return;
+    }
+
     // ── Heartbeat every 10 s ─────────────────────────────────────────────────
     if (now - last_beat_ms >= 10000UL) {
         last_beat_ms = now;
-        Serial1.print("ALIVE uptime=");  Serial1.print(now / 1000);
-        Serial1.print("s rx=");          Serial1.print(stat_rx);
-        Serial1.print(" relay=");        Serial1.print(stat_relay);
-        Serial1.print(" drop=");         Serial1.println(stat_drop);
+        slog("ALIVE uptime=%lus ts=%lu rx=%lu relay=%lu drop=%lu",
+             (unsigned long)(now / 1000), (unsigned long)cli_now_epoch(),
+             (unsigned long)stat_rx, (unsigned long)stat_relay, (unsigned long)stat_drop);
         led_blink(1, 80);   // heartbeat blink every 10 s
     }
 
-    // ── ADVERT timers (local 2min + flood 12h, MeshCore standard) ───────────
+    // ── CLI-triggered advert ─────────────────────────────────────────────────
+    if (advert_pending) {
+        advert_pending = false;
+        rx_started = false;
+        rf_idle();
+        uint8_t abuf[MAX_PKT];
+        int     alen = build_advert(abuf);
+        stat_advert++;
+        slog("ADVERT %s", advert_zerohop ? "zerohop" : "flood");
+        digitalWrite(PIN_LED, LED_ON);
+        send_pkt(abuf, alen);
+        digitalWrite(PIN_LED, LED_OFF);
+        last_local_advert = now;   // don't double-send right after
+    }
+
+    // ── Discovery burst (discover.neighbors / advert.zerohop) ────────────────
+    if (discovery_burst && (now - last_burst_ms) >= DISCOVERY_INTERVAL_MS) {
+        last_burst_ms = now;
+        discovery_burst--;
+        rx_started = false;
+        rf_idle();
+        uint8_t abuf[MAX_PKT];
+        int     alen = build_advert(abuf);
+        stat_advert++;
+        slog("ADVERT discover %u", (unsigned)discovery_burst);
+        digitalWrite(PIN_LED, LED_ON);
+        send_pkt(abuf, alen);
+        digitalWrite(PIN_LED, LED_OFF);
+    }
+
+    // ── ADVERT timers (intervals from cfg, MeshCore standard) ────────────────
+    uint32_t local_iv  = (uint32_t)cfg.zerohop_adv_min * 60UL * 1000UL;  // 0 = off
+    uint32_t flood_iv  = (uint32_t)cfg.flood_advert_h * 3600UL * 1000UL;
+
     bool do_advert = false;
     const char* advert_type = "";
 
@@ -489,15 +656,16 @@ void loop(void) {
         last_local_advert = now;
         advert_type = "initial";
     }
-    // Flood ADVERT every 12 hours (global presence)
-    else if (first_advert && (now - last_flood_advert) >= FLOOD_ADVERT_INTERVAL_MS) {
+    // Flood ADVERT every N hours (global presence)
+    else if (first_advert && (now - last_flood_advert) >= flood_iv) {
         do_advert = true;
         last_flood_advert = now;
         last_local_advert = now;  // sync both timers
         advert_type = "flood";
     }
-    // Local ADVERT every 2 minutes (neighbor discovery)
-    else if (first_advert && (now - last_local_advert) >= LOCAL_ADVERT_INTERVAL_MS) {
+    // Local (zero-hop) ADVERT every N minutes (neighbor discovery)
+    else if (first_advert && local_iv > 0 &&
+             (now - last_local_advert) >= local_iv) {
         do_advert = true;
         last_local_advert = now;
         advert_type = "local";
@@ -508,7 +676,8 @@ void loop(void) {
         rf_idle();
         uint8_t abuf[MAX_PKT];
         int     alen = build_advert(abuf);
-        Serial1.print("ADVERT "); Serial1.println(advert_type);
+        stat_advert++;
+        slog("ADVERT %s", advert_type);
         digitalWrite(PIN_LED, LED_ON);
         send_pkt(abuf, alen);
         digitalWrite(PIN_LED, LED_OFF);
@@ -523,7 +692,7 @@ void loop(void) {
         rf_rx();
         int err = radio.startReceive();
         if (err != RADIOLIB_ERR_NONE) {
-            Serial1.print("startReceive err: "); Serial1.println(err);
+            slog("startReceive err: %d", (int)err);
         }
         rx_started = true;
     }
@@ -538,9 +707,7 @@ void loop(void) {
             int   rxlen = (int)radio.getPacketLength();
             float rssi  = radio.getRSSI();
             int   snr   = (int)radio.getSNR();
-            Serial1.print("RX RSSI="); Serial1.print((int)rssi);
-            Serial1.print(" SNR=");    Serial1.print(snr);
-            Serial1.print(" len=");    Serial1.println(rxlen);
+            slog("RX RSSI=%d SNR=%d len=%d", (int)rssi, (int)snr, (int)rxlen);
             if (rxlen > 0 && rxlen < MAX_PKT) {
                 stat_rx++;
                 led_blink(1, 40);         // 1 blink = pkt received
@@ -555,14 +722,15 @@ void loop(void) {
             }
         } else {
             // CRC error or other read failure — re-arm and continue
-            Serial1.print("readData err: "); Serial1.println(state);
+            slog("readData err: %d", (int)state);
         }
     }
-        // ── Enter SLEEP until next interrupt ─────────────────────────────────────
+
+    // ── Enter SLEEP until next interrupt ─────────────────────────────────────
     // __WFI() halts the CPU in SLEEP mode until any interrupt fires:
     //   - SysTick (every 1ms) keeps millis() running → ADVERT/heartbeat timing
     //     and IWatchdog.reload() still work (loop re-runs each tick)
     //   - DIO1 (PC15) interrupt wakes on incoming packet → sets rx_flag
     // This reduces CPU power vs. spinning the loop continuously.
-    __WFI(); 
+    __WFI();
 }

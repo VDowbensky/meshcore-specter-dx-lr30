@@ -10,9 +10,9 @@
 
 set -e
 
-PORT="/dev/ttyUSB0"
+PORT="/dev/cu.usbserial-10"
 BAUD=57600  # This board requires 57600, not 115200
-FW=".pio/build/specter_repeater/firmware.bin"
+FW=".pio/build/specter/firmware.bin"
 BUILD=true
 MONITOR=false
 
@@ -42,8 +42,8 @@ if [[ ! -f "$FW" ]]; then
     exit 1
 fi
 
-SIZE=$(stat -c%s "$FW")
-echo "Firmware: $FW ($SIZE bytes)"
+#SIZE=$(stat -c%s "$FW")
+echo "Firmware: $FW (9999 bytes)"
 echo ""
 
 # -- Bootloader instructions --------------------------------------------------

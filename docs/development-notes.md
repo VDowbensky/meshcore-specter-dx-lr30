@@ -485,6 +485,124 @@ Relay hop=2
 
 ---
 
+## newlib-nano Float printf Is a Silent No-op
+
+### The Problem
+
+`snprintf(buf, n, "%.6f", x)` on the ststm32/newlib-nano toolchain compiles
+fine but prints **nothing** — no warning, no crash, just a truncated/empty
+string. Every CLI command that formatted a float (`get lat`, `get radio`,
+`get txdelay`) returned an empty line on hardware while looking correct in
+code review. `get radio` returned `,,8,8` (both floats silently dropped).
+
+### The Solution
+
+Do all decimal output and parsing in **integer fixed point**:
+
+```c
+// format: micro-degrees → "52.520007"
+static void print_fixed(int32_t x, int decimals) {
+    bool neg = x < 0;
+    uint32_t v = neg ? (uint32_t)(-x) : (uint32_t)x;
+    uint32_t scale = 1;
+    for (int i = 0; i < decimals; i++) scale *= 10;
+    if (neg) Serial1.print('-');
+    Serial1.print(v / scale);
+    Serial1.print('.');
+    uint32_t frac = v % scale;
+    for (uint32_t m = scale / 10; m > 0; m /= 10)
+        Serial1.print((frac / m) % 10);
+    Serial1.println();
+}
+```
+
+(Alternative: enable float printf via a nano.specs file, but that costs
+~14 KB of flash — SPECTER's CLI avoids it entirely.)
+
+### Verification
+
+- `get lat` → `52.520007` · `get radio` → `869.618,62.5,8,8` ✓
+- Firmware shrank 75 KB → 61 KB after removing float printf support
+
+---
+
+## USB Serial Port Contention (PommeCore)
+
+The MeshCore companion app **PommeCore holds /dev/cu.usbserial-10 open**
+and consumes all serial traffic. Symptoms: CLI test scripts receive nothing
+(or intermittent EIO "readiness but no data" errors from the CH340 driver),
+while the device LED shows normal operation.
+
+```bash
+lsof /dev/cu.usbserial-10   # → quit the listed app before CLI work
+```
+
+---
+
+## config.meshcore.io USB Compatibility (v1.14.0)
+
+The official **config.meshcore.io** web client (the one the MeshCore FAQ
+points you to for USB repeater config) speaks plain text, but its parser
+(`lib/serial-cli.js`) requires **three** byte-exact things. Missing any of
+them makes a command silently time out (5 s) or a variable "unsupported":
+
+1. **Reply marker** `  -> ` — parser does `readBuffer.indexOf("  -> ")`.
+2. **CRLF** line ends — parser does `indexOf('\r\n', payloadStart)`.
+3. **`> ` value prefix on `get` replies** — `parseVariableResponse()` does
+   `response.startsWith("> ")` then `substring(2)`. The official firmware
+   formats every `get` reply as `"> <value>"`, so the full line is
+   `  -> > <value>\r\n`.
+
+The third is the subtle one: without it, every `get` parses to null, the app
+marks the variable unsupported, and `setData()` skips it — so the UI shows
+"saved" but the device kept its old values. SPECTER emits `get` replies via
+`getv()`/`getv_num()` (`  -> > <value>\r\n`). The app's airtime slider uses
+variable `af` (`duty% = 100/(af+1)`), bridged to our `dutycycle`. Version
+`1.14.0` is what the app's `varMinVersion` feature-detection needs to expose
+`loop.detect` (the version number drives *only* `supportsVar`).
+
+> The phone apps (PommeCore / meshcore.js / **app.meshcore.nz**) are
+> **companion** clients (framed `0x3C/0x3E` + login) and cannot administer a
+> repeater over USB — that's by design, not a bug. Use config.meshcore.io.
+
+---
+
+## Radio-Init Failure Must Not Halt (v1.14.0)
+
+**Problem:** the old `setup()` did `while(true){ blink }` when
+`radio_init()` failed. A single bad setting (or a transient RF fault) then
+**bricked the serial CLI** — no `erase`, no `set`, no recovery except a
+reflash. This actually happened: a `set radio` with an invalid bandwidth made
+the device boot into a blink loop that would not answer the CLI.
+
+**Fix:** on failure, set `radio_ok = false` and enter **degraded mode**.
+`loop()` keeps calling `cli_poll()` (serial is never bricked) and retries
+`radio_init()` every 3 s (triple-blink LED while down). Correct the setting
+over serial and the radio recovers on the next retry — no reflash, no reboot
+required. Solid-on LED = radio not ready; off = ready.
+
+---
+
+## `set radio` Bandwidth Validation Was Broken (v1.14.0)
+
+`parse_radio()` validated bandwidth as `7000000–50000000` (micro-kHz) =
+**7–50 kHz**, so every *real* LoRa bandwidth (62.5/125/250/500 kHz) was
+rejected while invalid ones slipped through. Corrected to `7.8–500 kHz`
+(SX1262 range), and frequency to the SX1262's `150–960 MHz`. Ranges are now
+freq 150–960 MHz, BW 7.8–500 kHz, SF 5–12, CR 5–8.
+
+---
+
+## CH340 USB Link Drops After CLI `reboot`
+
+After a CLI `reboot` (`NVIC_SystemReset`), the **Mac-side USB-serial link
+drops** and the port goes silent. The device reboots fine underneath and all
+settings persist across the reboot (verified) — the CH340 just needs a cable
+power-cycle to re-enumerate on macOS. A full unplug/replug restores the link.
+This is a CH340/macOS quirk, not a firmware fault.
+
+---
+
 ## Conclusion
 
 The DX-LR30 is a **capable and cheap** MeshCore repeater when the following

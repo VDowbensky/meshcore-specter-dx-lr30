@@ -6,6 +6,10 @@ The DX-LR30 uses an **STM32F103C8T6** with a factory UART bootloader accessible
 via BOOT0 pin. The CH340 USB-serial chip **cannot** control BOOT0 or NRST in
 software on this board, physical button interaction is required.
 
+> **Shortcut (optional):** if BOOT0/RESET are also routed to free GPIOs,
+> firmware ≥ 1.2.1 can enter the bootloader itself via the CLI `dfu`
+> command — see [cli.md §3.5](cli.md#35-flashing-without-buttons-optional).
+
 ```mermaid
 flowchart TD
     classDef tool fill:#1e3a5f,stroke:#4a90d9,color:#e8f4fd

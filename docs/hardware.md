@@ -87,6 +87,11 @@ sequenceDiagram
     Note over STM: Listening on USART1<br/>57600 8E1 · waiting for 0x7F
 ```
 
+> **Programmatic entry (optional):** if the board's BOOT0 and RESET lines
+> are also routed to free GPIOs, SPECTER ≥ 1.2.1 can enter the bootloader
+> itself via the CLI `dfu` command (build with `-D DFU_BOOT0_PIN=.. -D
+> DFU_RST_PIN=..`). See [cli.md §3.5](cli.md#35-flashing-without-buttons-optional).
+
 ### STM32F103 Bootloader Specs
 
 | Parameter | Value |
