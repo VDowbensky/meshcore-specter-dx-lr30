@@ -82,7 +82,6 @@ flowchart LR
 ```
 
 > SPI bus: **SPI1** (PA5/PA6/PA7). Serial console: **USART1** (PA9/PA10).
-> DIO1 is not exposed on the DX-LR30 module, RadioLib runs in **polling mode**.
 
 ---
 
