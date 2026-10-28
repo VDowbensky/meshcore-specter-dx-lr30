@@ -2,6 +2,9 @@
 
 > The DX-LR30 is a cheap Chinese LoRa shell device. MeshCore has no official
 > firmware for STM32F103 + SX1262.
+> Specter is a very energy efficient LoRa Meshcore repeater, consuming 0.5-150 mA.
+> It can be configured over USB using https://config.meshcore.io/ 
+> or via TTY using the Meshcore CLI protocol
 
 ---
 
@@ -51,7 +54,7 @@ flowchart LR
 |-----------|------|-------|
 | MCU | STM32F103C8T6 | 72 MHz Cortex-M3, 64KB Flash, 20KB RAM |
 | Radio | SX1262 | Sub-GHz LoRa, up to +22 dBm |
-| USB-Serial | CH340 | Bootloader access via physical BOOT0+RESET buttons |
+| USB-Serial | CH340 | Admin CLI @115200 · bootloader via BOOT0+RESET buttons |
 | LED | PB11 | Active HIGH — 1 blink = RX · 2 fast blinks = relay · solid = ADVERT TX |
 
 ### Pin Map
@@ -192,19 +195,6 @@ For **FLOOD** types: dedup cache + loop detection (own hash already in path) pre
 storms. For **DIRECT** types: the full route is pre-computed by the source node;
 SPECTER only forwards if it is on that route.
 
-### Radio Configuration
-
-| Parameter | Value | Why |
-|-----------|-------|-----|
-| Frequency | 869.618 MHz | EU868 MeshCore channel |
-| Spreading Factor | SF8 | Balance range/speed |
-| Bandwidth | 62.5 kHz | Narrow, more range |
-| Coding Rate | 4/8 | EU/UK Narrow preset standard |
-| Sync Word | 0x12 | LoRa private network |
-| TX Power | 14 dBm | Compliant + range |
-| CRC | 16-bit | Enabled |
-
----
 
 ## Building
 
@@ -232,18 +222,20 @@ No manual installation needed, `pio run` fetches them automatically.
 ```bash
 cd dx-lr30-fw
 pio run -e specter
-# Output: .pio/build/specter/firmware.bin  (~50KB)
+# Output: .pio/build/specter/firmware.bin  (~61KB)
 ```
 
 ### Memory Usage
 
 ```
-RAM:   ██░░░░░░░░  15.2%  (3116 / 20480 bytes)
-Flash: ████░░░░░░  38.5%  (50408 / 131072 bytes)*
+RAM:   ███░░░░░░░  22.3%  (4568 / 20480 bytes)
+Flash: █████░░░░░  46.8%  (61324 / 131072 bytes)*
 ```
 
 \* Many STM32F103C8T6 clones have 128KB flash (labeled as 64KB). SPECTER
-fits comfortably in genuine 64KB chips as well (~79% utilization).
+fits comfortably in genuine 64KB chips as well. The last flash page
+(0x0801F000) is reserved for CLI settings storage and stays clear of the
+firmware image.
 
 ---
 
@@ -295,32 +287,75 @@ stm32flash \
 
 ---
 
-## Serial Monitor
+## Serial Console & CLI
 
-Connect at **115200 8N1** on `/dev/ttyUSB0`. Press RESET to see startup:
+Connect at **115200 8N1**. The same port serves both the log console and the
+**MeshCore-style admin CLI** (the device has no buttons — USB is the only
+admin channel). Press RESET to see startup:
 
 ```
-=== SPECTER MeshCore Repeater v1.1.0 [SPECTER-A3F2] ===
+=== SPECTER MeshCore Repeater v1.4.0 [SPECTER-A3F2] ===
 Hash: 0xF4
 Radio init... OK
-ADVERT initial
-ALIVE uptime=10s
-ALIVE uptime=20s
-RX RSSI=-87 SNR=7 len=110
-Relay hop=2
-Drop: dedup
-ALIVE uptime=30s
+>
 ```
 
 > The node name (`SPECTER-A3F2`) and hash are unique per device.
+> The console is **silent after boot** — an interactive prompt is shown and
+> all runtime diagnostics go to a ring buffer. Type `log` any time to see
+> the 20 most recent lines (heartbeats, RX, relay, drops).
+
+### Finding the serial port
 
 ```bash
-# Quick monitor
-python3 -m serial.tools.miniterm /dev/ttyUSB0 115200
+ls /dev/cu.usbserial-*   # macOS (CH340 driver required)
+ls /dev/ttyUSB*          # Linux
+```
 
-# Or
+⚠️ If nothing arrives, check no other app holds the port — the MeshCore
+companion (PommeCore) silently consumes all serial data:
+`lsof /dev/cu.usbserial-10` (macOS) / `fuser /dev/ttyUSB0` (Linux).
+
+### Connecting
+
+```bash
+# Recommended (clean LF line endings):
+python3 -m serial.tools.miniterm /dev/cu.usbserial-10 115200 --eol LF
+
+# Or:
+screen /dev/cu.usbserial-10 115200        # exit: Ctrl-A, K, y
+~/.platformio/penv/bin/pio device monitor -p /dev/cu.usbserial-10 -b 115200
+
+# Or:
 ./flash.sh --monitor
 ```
+
+### CLI quick tour
+
+Type commands directly (Enter after each). Full reference:
+[docs/cli.md](docs/cli.md#3-using-the-cli-operating-guide).
+
+```
+ver                          → 1.4.0 (Oct 26 2026)
+get name                     → DE.BW.LB-Bi-Bi.STM32
+set name DE.BW.Specter-01    → OK
+get lat / set lat 52.52      → 52.520000 / OK
+get radio                    → 869.618,62.5,8,8
+set radio 869.525,62.5,8,5   → OK, reboot to apply
+get flood.advert.interval    → 17            (hours, 3-168, EU default 47)
+set advert.interval 120      → OK            (zero-hop minutes, 60-240, 0=off)
+neighbors                    → F7A9:1793148995:45
+stats-packets                → rx=7 relay=4 drop=3 advert=1
+log / log clear              → last 20 diagnostic lines / empty buffer
+clock / time 1793052700      → re-sync advert clock
+advert / advert.zerohop      → trigger an ADVERT now
+reboot                       → (no reply, per spec)
+erase                        → factory reset (wipes stored settings)
+```
+
+All `set` commands persist to a dedicated flash page and survive power
+cycles. `erase` restores build-flag defaults. `set radio`/`set freq`/`set tx`
+require a `reboot` to take effect.
 
 ---
 
@@ -407,12 +442,16 @@ dx-lr30-fw/
 ├── flash.sh                 # Build + flash helper script (uses 57600 baud)
 ├── flash_stm32.py           # Pure Python bootloader flasher (fallback)
 ├── src/
-│   └── main.cpp             # Full firmware (~380 lines, Ed25519 + polling RX)
+│   ├── main.cpp             # Firmware: radio, protocol, advert, hooks
+│   ├── config.h             # Runtime config struct, EU defaults, CLI interface
+│   ├── cli.cpp              # USB-serial command-line parser + handlers
+│   └── prefs.cpp            # Persistent settings in reserved flash page
 └── docs/
     ├── hardware.md          # Pin map, schematic notes, UID reference
     ├── protocol.md          # MeshCore packet format, Ed25519 signing
     ├── flashing.md          # Detailed flashing guide (57600 baud)
-    └── development-notes.md # Critical lessons learned (baud rate, Ed25519, polling)
+    ├── cli.md               # CLI command plan, operating guide, progress
+    └── development-notes.md # Critical lessons learned (baud rate, Ed25519, polling, %f)
 ```
 
 ---
@@ -426,7 +465,7 @@ dx-lr30-fw/
 | Protocol | Full MeshCore v1 | Full MeshCore v1 flood |
 | Cryptography | Ed25519 signing | Ed25519 signing (deterministic from UID) |
 | Cost | $25–$60 | ~$8 |
-| MCU Flash used | varies | 50KB / 128KB (38.5%) |
+| MCU Flash used | varies | 61KB / 128KB (46.8 %) |
 | Runs standalone | ✅ | ✅ |
 
 The DX-LR30 was designed as a LoRa **AT-command shell** (similar to a Hayes
@@ -439,8 +478,9 @@ counting, path tracking, Ed25519 signing, and ADVERT generation.
 ## Documentation
 
 ### Quick Start
-- [README.md](README.md), This file: overview, build, flash
+- [README.md](README.md), This file: overview, build, flash, CLI
 - [docs/flashing.md](docs/flashing.md), Step-by-step flashing guide
+- [docs/cli.md](docs/cli.md), CLI command reference + operating guide
 
 ### Technical Details
 - [docs/hardware.md](docs/hardware.md), Pin assignments, bootloader specs, UID
@@ -463,6 +503,15 @@ counting, path tracking, Ed25519 signing, and ADVERT generation.
 
 **Radio params mismatch:**
 → All params must match: frequency, SF, BW, CR, sync word. See [development-notes.md](docs/development-notes.md#radio-configuration-mismatch-symptoms)
+
+**CLI/monitor shows nothing but the LED works:**
+→ Another app (usually the PommeCore companion) holds the serial port and
+consumes all data. `lsof /dev/cu.usbserial-10`, quit it, reconnect.
+See [development-notes.md](docs/development-notes.md#usb-serial-port-contention-pommecore)
+
+**Float values print empty (`get radio` → `,,8,8`):**
+→ newlib-nano stubs out float `printf`. Fixed in v1.2.1 (integer fixed-point
+formatting). See [development-notes.md](docs/development-notes.md#newlib-nano-float-printf-is-a-silent-no-op)
 
 ---
 
