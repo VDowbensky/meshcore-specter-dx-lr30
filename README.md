@@ -336,7 +336,7 @@ Type commands directly (Enter after each). Full reference:
 
 ```
 ver                          → 1.4.0 (Oct 26 2026)
-get name                     → DE.BW.LB-Bi-Bi.STM32
+get name                     → SPECTER.REPEATER
 set name DE.BW.Specter-01    → OK
 get lat / set lat 52.52      → 52.520000 / OK
 get radio                    → 869.618,62.5,8,8
@@ -486,33 +486,6 @@ counting, path tracking, Ed25519 signing, and ADVERT generation.
 - [docs/protocol.md](docs/protocol.md), MeshCore packet format, Ed25519 signing
 - [docs/development-notes.md](docs/development-notes.md), **Critical lessons learned**
 
-### Troubleshooting
-
-**"Failed to init device" when flashing:**
-→ Use `-b 57600` baud (not 115200). See [development-notes.md](docs/development-notes.md#critical-stm32-bootloader-baud-rate)
-
-**Board stuck in fast LED blink (radio HALT):**
-→ The IWDG watchdog auto-resets the board in ≤ 8 s and retries. Transient SX1262 SPI glitches recover without intervention. See [development-notes.md](docs/development-notes.md#independent-watchdog-iwdg)
-
-**Repeater doesn't appear in MeshCore app:**
-→ Verify Ed25519 signing is enabled and radio params match exactly. See [development-notes.md](docs/development-notes.md#ed25519-signature-requirement)
-
-**"Listening..." prints once then silence:**
-→ RadioLib polling mode issue. See [development-notes.md](docs/development-notes.md#radiolib-polling-mode-dio1-not-connected)
-
-**Radio params mismatch:**
-→ All params must match: frequency, SF, BW, CR, sync word. See [development-notes.md](docs/development-notes.md#radio-configuration-mismatch-symptoms)
-
-**CLI/monitor shows nothing but the LED works:**
-→ Another app (usually the PommeCore companion) holds the serial port and
-consumes all data. `lsof /dev/cu.usbserial-10`, quit it, reconnect.
-See [development-notes.md](docs/development-notes.md#usb-serial-port-contention-pommecore)
-
-**Float values print empty (`get radio` → `,,8,8`):**
-→ newlib-nano stubs out float `printf`. Fixed in v1.2.1 (integer fixed-point
-formatting). See [development-notes.md](docs/development-notes.md#newlib-nano-float-printf-is-a-silent-no-op)
-
----
 
 ## License
 
