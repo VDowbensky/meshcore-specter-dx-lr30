@@ -75,13 +75,13 @@ static bool flash_read_words(const uint32_t* src, uint32_t* dst, int n)
 {
   for (int i = 0; i < n; i++) 
   {
-    if (src[i] == 0xFFFFFFFFUL) return false;   // erased page
+    //if (src[i] == 0xFFFFFFFFUL) return false;   // erased page
     dst[i] = src[i];
   }
   return true;
 }
 
-static bool flash_write_words(uint32_t addr, const uint32_t* data, int n) 
+static bool flash_write_words(uint32_t addr, const uint32_t* data, int n) //rewrite using bare registers! 
 {
   uint32_t err;
   __disable_irq();
@@ -133,7 +133,7 @@ void prefs_erase(void)
   __enable_irq();
 }
 
-void prefs_load(void) 
+void prefs_load(void) //
 {
   config_defaults();
   const uint32_t* src = (const uint32_t*)PREFS_ADDR;
