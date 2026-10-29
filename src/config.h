@@ -9,11 +9,11 @@
 
 // ─── Defaults (EU868, per docs/cli.md §2) ───────────────────────────────────
 #define DEF_NAME        "SPECTER-XXXX"   // replaced by auto name / build flag
-#define DEF_FREQ_KHZ    869618           // 869.618 MHz (MeshCore EU868 default)
+#define DEF_FREQ_KHZ    433650           // 869.618 MHz (MeshCore EU868 default)
 #define DEF_BW_TENTH    625              // 62.5 kHz  (stored as kHz * 10)
 #define DEF_SF          8
 #define DEF_CR          8                // passed straight to RadioLib (tested)
-#define DEF_TX_DBM      14               // safe under EU 27 dBm EIRP
+#define DEF_TX_DBM      22               // safe under EU 27 dBm EIRP
 #define DEF_FLOOD_ADV_H 47               // hours, 3-168 (MeshCore repeater default)
 #define DEF_ZERO_ADV_M  60               // minutes, 0 (off) or 60-240
 #define DEF_LOOP_DETECT 1                // 0 off, 1 minimal, 2 moderate, 3 strict
